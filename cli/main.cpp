@@ -4,16 +4,14 @@
 #include <cstring>
 #include <queue>
 #include <set>
+#include <unordered_set>
+#include <unordered_map>
 #include <map>
 
 void print_usage(const char* program_name) {
     std::cout << "ELF Syscall Inspector v" << libesc::get_version() << "\n\n";
-    std::cout << "Usage: " << program_name << " [options] <elf_binary>\n\n";
-    std::cout << "Options:\n";
-    std::cout << "  -i, --info        Display ELF binary information\n";
-    std::cout << "  -s, --syscalls    Detect syscalls\n";
-    std::cout << "  -c, --cfg         Perform CFG analysis\n";
-    std::cout << "  -h, --help        Show this help message\n";
+    std::cout << "Usage: " << program_name << " <elf_binary>\n\n";
+    std::cout << "Analyzes Linux ELF binaries and detects syscall invocations.\n";
 }
 
 std::string get_syscall_name(int syscall_num) {
@@ -35,8 +33,10 @@ std::string get_syscall_name(int syscall_num) {
         {78, "getdents"}, {79, "getcwd"}, {80, "chdir"},
         {89, "readlink"}, {96, "gettimeofday"},
         {158, "arch_prctl"}, {186, "gettid"}, {202, "futex"},
-        {217, "getdents64"}, {231, "exit_group"}, {234, "tgkill"},
-        {257, "openat"}, {262, "newfstatat"}, {292, "dup3"}
+        {217, "getdents64"}, {218, "set_tid_address"}, {231, "exit_group"},
+        {234, "tgkill"}, {257, "openat"}, {262, "newfstatat"}, {267, "readlinkat"},
+        {273, "set_robust_list"}, {292, "dup3"}, {302, "prlimit64"},
+        {318, "getrandom"}, {322, "execveat"}, {334, "rseq"}
     };
 
     auto it = syscall_table.find(syscall_num);
@@ -44,162 +44,116 @@ std::string get_syscall_name(int syscall_num) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
+    if (argc != 2 || std::strcmp(argv[1], "-h") == 0 || std::strcmp(argv[1], "--help") == 0) {
         print_usage(argv[0]);
-        return 1;
+        return (argc == 2) ? 0 : 1;
     }
 
-    bool show_info = false;
-    bool detect_syscalls = false;
-    bool analyze_cfg = false;
-    const char* binary_path = nullptr;
-
-    // Parse arguments
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        } else if (std::strcmp(argv[i], "-i") == 0 || std::strcmp(argv[i], "--info") == 0) {
-            show_info = true;
-        } else if (std::strcmp(argv[i], "-s") == 0 || std::strcmp(argv[i], "--syscalls") == 0) {
-            detect_syscalls = true;
-        } else if (std::strcmp(argv[i], "-c") == 0 || std::strcmp(argv[i], "--cfg") == 0) {
-            analyze_cfg = true;
-        } else {
-            binary_path = argv[i];
-        }
-    }
-
-    if (!binary_path) {
-        std::cerr << "Error: No binary path specified\n";
-        print_usage(argv[0]);
-        return 1;
-    }
+    const char* binary_path = argv[1];
 
     try {
         libesc::ElfInspector inspector(binary_path);
-
-        if (show_info) {
-            auto info = inspector.get_info();
-            std::cout << "=== ELF Information ===\n";
-            std::cout << "Path: " << info.path << "\n";
-            std::cout << "Architecture: " << info.architecture << "\n";
-            std::cout << "64-bit: " << (info.is_64bit ? "Yes" : "No") << "\n";
-            std::cout << "Entry point: 0x" << std::hex << info.entry_point << "\n\n";
+        
+        auto arch = libesc::Disassembler::Architecture::X86_64;
+        libesc::Disassembler disasm(arch);
+        
+        auto code = inspector.get_code_section();
+        auto cfg = disasm.disassemble(code, inspector.get_text_base());
+        // Pre-build address-to-block map for fast lookups
+        std::unordered_map<uint64_t, const libesc::BasicBlock*> addr_to_block;
+        addr_to_block.reserve(cfg.blocks.size());
+        for (const auto& block : cfg.blocks) {
+            addr_to_block[block.start_address] = &block;
         }
-
-        if (detect_syscalls || analyze_cfg) {
-            auto arch = libesc::Disassembler::Architecture::X86_64;
-            libesc::Disassembler disasm(arch);
+        
+        // Build predecessor map (blocks that jump TO each block)
+        std::unordered_map<const libesc::BasicBlock*, std::vector<const libesc::BasicBlock*>> predecessors;
+        for (const auto& block : cfg.blocks) {
+            for (uint64_t succ_addr : block.successors) {
+                auto it = addr_to_block.find(succ_addr);
+                if (it != addr_to_block.end()) {
+                    predecessors[it->second].push_back(&block);
+                }
+            }
+        }
+        
+        // For syscall blocks without RAX set, search backwards to find RAX values
+        // Limit search depth to avoid performance issues
+        const int MAX_BACKWARD_DEPTH = 5;
+        
+        auto find_rax_values = [&](const libesc::BasicBlock* syscall_block) -> std::set<int64_t> {
+            std::set<int64_t> rax_values;
             
-            auto code = inspector.get_code_section();
-            auto cfg = disasm.disassemble(code, inspector.get_text_base());
-
-            if (analyze_cfg) {
-                std::cout << "=== Control Flow Graph ===\n";
-                std::cout << "Basic blocks: " << cfg.blocks.size() << "\n\n";
+            // If block sets RAX before syscall, use that
+            if (syscall_block->syscall_rax_value >= 0) {
+                rax_values.insert(syscall_block->syscall_rax_value);
+                return rax_values;
             }
+            
+            // Otherwise, search backwards through predecessors
+            std::unordered_set<const libesc::BasicBlock*> visited;
+            std::vector<std::pair<const libesc::BasicBlock*, int>> worklist; // (block, depth)
+            
+            for (auto* pred : predecessors[syscall_block]) {
+                worklist.push_back({pred, 1});
+            }
+            
+            while (!worklist.empty()) {
+                auto [block, depth] = worklist.back();
+                worklist.pop_back();
                 
-            if (detect_syscalls) {
-                // Find reachable blocks from entry point
-                std::set<const libesc::BasicBlock*> reachable;
-                std::queue<const libesc::BasicBlock*> worklist;
+                if (visited.count(block) || depth > MAX_BACKWARD_DEPTH) {
+                    continue;
+                }
+                visited.insert(block);
                 
-                auto* entry_block = cfg.find_block(inspector.get_entry_point());
-                if (entry_block) {
-                    worklist.push(entry_block);
-                    
-                    while (!worklist.empty()) {
-                        auto* block = worklist.front();
-                        worklist.pop();
-                        
-                        if (reachable.count(block)) {
-                            continue;
-                        }
-                        reachable.insert(block);
-                        
-                        // Follow successors
-                        for (uint64_t succ_addr : block->successors) {
-                            auto* succ = cfg.find_block(succ_addr);
-                            if (succ && !reachable.count(succ)) {
-                                worklist.push(succ);
-                            }
-                        }
+                // If this block sets RAX, use that value
+                if (block->last_rax_value >= 0) {
+                    rax_values.insert(block->last_rax_value);
+                } else {
+                    // Keep searching backwards
+                    for (auto* pred : predecessors[block]) {
+                        worklist.push_back({pred, depth + 1});
                     }
                 }
+            }
+            
+            // If no RAX value found, mark as unknown
+            if (rax_values.empty()) {
+                rax_values.insert(-1);
+            }
+            
+            return rax_values;
+        };
+        
+        // Collect syscalls
+        std::cout << "=== Syscalls ===\n";
+        int syscall_count = 0;
+        for (const auto& block : cfg.blocks) {
+            if (block.contains_syscall) {
+                auto rax_values = find_rax_values(&block);
                 
-                // Propagate RAX values and collect syscalls
-                std::map<const libesc::BasicBlock*, std::set<int64_t>> block_rax_values;
-                block_rax_values[entry_block].insert(-1);  // Unknown at entry
-                
-                std::queue<const libesc::BasicBlock*> dataflow_worklist;
-                std::set<const libesc::BasicBlock*> processed;
-                dataflow_worklist.push(entry_block);
-                
-                while (!dataflow_worklist.empty()) {
-                    auto* block = dataflow_worklist.front();
-                    dataflow_worklist.pop();
-                    
-                    if (processed.count(block)) {
-                        continue;
-                    }
-                    processed.insert(block);
-                    
-                    auto current_rax = block_rax_values[block];
-                    
-                    // Update RAX value if block modifies it
-                    if (block->last_rax_value >= 0) {
-                        current_rax.clear();
-                        current_rax.insert(block->last_rax_value);
-                    }
-                    
-                    // Propagate to successors
-                    for (uint64_t succ_addr : block->successors) {
-                        auto* succ = cfg.find_block(succ_addr);
-                        if (succ && reachable.count(succ)) {
-                            bool changed = false;
-                            for (int64_t val : current_rax) {
-                                if (block_rax_values[succ].insert(val).second) {
-                                    changed = true;
-                                }
-                            }
-                            if (changed) {
-                                processed.erase(succ);
-                                dataflow_worklist.push(succ);
-                            }
+                for (int64_t rax_val : rax_values) {
+                    std::cout << "0x" << std::hex << block.syscall_address << ": ";
+                    if (rax_val >= 0) {
+                        std::cout << "syscall " << std::dec << rax_val;
+                        std::string name = get_syscall_name(rax_val);
+                        if (!name.empty()) {
+                            std::cout << " (" << name << ")";
                         }
+                    } else {
+                        std::cout << "syscall (number unknown)";
                     }
+                    std::cout << "\n";
+                    syscall_count++;
+                    break;  // Only count each syscall location once
                 }
-                
-                // Collect syscalls
-                std::cout << "=== Reachable Syscalls ===\n";
-                int syscall_count = 0;
-                for (const auto& block : cfg.blocks) {
-                    if (reachable.count(&block) && block.contains_syscall) {
-                        const auto& rax_values = block_rax_values[&block];
-                        for (int64_t rax_val : rax_values) {
-                            std::cout << "0x" << std::hex << block.end_address << ": ";
-                            if (rax_val >= 0) {
-                                std::cout << "syscall " << std::dec << rax_val;
-                                std::string name = get_syscall_name(rax_val);
-                                if (!name.empty()) {
-                                    std::cout << " (" << name << ")";
-                                }
-                            } else {
-                                std::cout << "syscall (number unknown)";
-                            }
-                            std::cout << "\n";
-                            syscall_count++;
-                            break;  // Only count each syscall location once
-                        }
-                    }
-                }
-                if (syscall_count == 0) {
-                    std::cout << "No syscalls detected\n";
-                }
-                std::cout << "\n";
             }
         }
+        if (syscall_count == 0) {
+            std::cout << "No syscalls detected\n";
+        }
+        std::cout << "\n";
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";

@@ -37,168 +37,156 @@ public:
             return ControlFlowGraph{};
         }
 
-        // First pass: decode all instructions and identify block boundaries
-        struct DecodedInstruction {
-            uint64_t address;
-            uint32_t length;
-            bool is_branch;
-            bool is_call;
-            bool is_ret;
-            bool is_syscall;
-            bool is_mov_to_rax;
-            int64_t rax_value;
-            uint64_t jump_target;
-            bool is_unconditional_jump;
-        };
+        ControlFlowGraph cfg;
+        std::set<uint64_t> processed;  // Blocks we've already built
+        std::set<uint64_t> worklist;   // Block starts to process
         
-        std::vector<DecodedInstruction> instructions;
-        std::set<uint64_t> block_starts;
+        // Start from entry point
+        worklist.insert(base_address);
         
-        // Entry point is a block start
-        block_starts.insert(base_address);
-        
-        size_t offset = 0;
-        while (offset < code.size()) {
-            ZydisDecodedInstruction insn;
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        while (!worklist.empty()) {
+            uint64_t block_start = *worklist.begin();
+            worklist.erase(worklist.begin());
             
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder_,
-                                                    code.data() + offset,
-                                                    code.size() - offset,
-                                                    &insn,
-                                                    operands))) {
-                DecodedInstruction decoded;
-                decoded.address = base_address + offset;
-                decoded.length = insn.length;
-                decoded.is_branch = (insn.meta.category == ZYDIS_CATEGORY_COND_BR ||
-                                   insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR);
-                decoded.is_call = (insn.meta.category == ZYDIS_CATEGORY_CALL);
-                decoded.is_ret = (insn.meta.category == ZYDIS_CATEGORY_RET);
-                decoded.is_syscall = (insn.mnemonic == ZYDIS_MNEMONIC_SYSCALL ||
-                                    insn.mnemonic == ZYDIS_MNEMONIC_SYSENTER ||
-                                    (insn.mnemonic == ZYDIS_MNEMONIC_INT && 
-                                     insn.operand_count > 0 &&
-                                     operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-                                     operands[0].imm.value.u == 0x80));
+            // Skip if already processed or out of bounds
+            if (processed.count(block_start) || block_start < base_address) {
+                continue;
+            }
+            size_t offset = block_start - base_address;
+            if (offset >= code.size()) {
+                continue;
+            }
+            
+            processed.insert(block_start);
+            
+            // Build this block by decoding instructions until terminator
+            BasicBlock block;
+            block.start_address = block_start;
+            int64_t current_rax = -1;  // Track current RAX value through the block
+            
+            while (offset < code.size()) {
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
                 
-                // Check for mov rax/eax, imm
-                decoded.is_mov_to_rax = false;
-                decoded.rax_value = -1;
+                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder_,
+                                                         code.data() + offset,
+                                                         code.size() - offset,
+                                                         &insn,
+                                                         operands))) {
+                    // Bad instruction - end block here
+                    break;
+                }
+                
+                uint64_t insn_addr = base_address + offset;
+                block.end_address = insn_addr;
+                
+                bool is_branch = (insn.meta.category == ZYDIS_CATEGORY_COND_BR ||
+                                  insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR);
+                bool is_call = (insn.meta.category == ZYDIS_CATEGORY_CALL);
+                bool is_ret = (insn.meta.category == ZYDIS_CATEGORY_RET ||
+                               insn.mnemonic == ZYDIS_MNEMONIC_HLT ||
+                               insn.mnemonic == ZYDIS_MNEMONIC_UD2);
+                bool is_syscall = (insn.mnemonic == ZYDIS_MNEMONIC_SYSCALL ||
+                                   insn.mnemonic == ZYDIS_MNEMONIC_SYSENTER ||
+                                   (insn.mnemonic == ZYDIS_MNEMONIC_INT && 
+                                    insn.operand_count > 0 &&
+                                    operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                                    operands[0].imm.value.u == 0x80));
+                
+                // Track mov rax/eax, imm
                 if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count == 2 &&
                     operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
                     (operands[0].reg.value == ZYDIS_REGISTER_RAX ||
                      operands[0].reg.value == ZYDIS_REGISTER_EAX) &&
                     operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                    decoded.is_mov_to_rax = true;
-                    decoded.rax_value = operands[1].imm.value.s;
+                    current_rax = operands[1].imm.value.s;
                 }
-                
-                // Calculate jump target
-                decoded.jump_target = 0;
-                decoded.is_unconditional_jump = (insn.mnemonic == ZYDIS_MNEMONIC_JMP);
-                if (decoded.is_branch && insn.operand_count > 0 &&
-                    operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                    uint64_t result;
-                    if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &operands[0], 
-                                                              decoded.address, &result))) {
-                        decoded.jump_target = result;
-                        // Jump target starts a new block
-                        block_starts.insert(result);
+                // Any other write to RAX/EAX makes it unknown
+                else if (insn.operand_count > 0 &&
+                         operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         (operands[0].reg.value == ZYDIS_REGISTER_RAX ||
+                          operands[0].reg.value == ZYDIS_REGISTER_EAX)) {
+                    // Check if this instruction writes to RAX (not just reads)
+                    bool writes_rax = false;
+                    for (size_t i = 0; i < insn.operand_count; i++) {
+                        if (operands[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            (operands[i].reg.value == ZYDIS_REGISTER_RAX ||
+                             operands[i].reg.value == ZYDIS_REGISTER_EAX) &&
+                            (operands[i].actions & ZYDIS_OPERAND_ACTION_WRITE)) {
+                            writes_rax = true;
+                            break;
+                        }
+                    }
+                    if (writes_rax) {
+                        current_rax = -1;  // Unknown value
                     }
                 }
                 
-                // Instruction after branch/call/ret/syscall starts a new block
-                if (decoded.is_branch || decoded.is_call || decoded.is_ret || decoded.is_syscall) {
-                    if (!decoded.is_unconditional_jump) {
-                        block_starts.insert(decoded.address + decoded.length);
-                    }
-                }
-                
-                instructions.push_back(decoded);
-                offset += insn.length;
-            } else {
-                // Skip bad byte
-                offset++;
-            }
-        }
-        
-        // Second pass: build basic blocks
-        std::map<uint64_t, size_t> addr_to_idx;
-        for (size_t i = 0; i < instructions.size(); i++) {
-            addr_to_idx[instructions[i].address] = i;
-        }
-        
-        std::vector<uint64_t> sorted_starts(block_starts.begin(), block_starts.end());
-        std::sort(sorted_starts.begin(), sorted_starts.end());
-        
-        ControlFlowGraph cfg;
-        
-        for (size_t i = 0; i < sorted_starts.size(); i++) {
-            uint64_t block_start = sorted_starts[i];
-            
-            auto it = addr_to_idx.find(block_start);
-            if (it == addr_to_idx.end()) {
-                continue;  // Block start not in valid instructions
-            }
-            
-            size_t start_idx = it->second;
-            size_t end_idx = start_idx;
-            
-            BasicBlock block;
-            block.start_address = block_start;
-            
-            // Find end of block
-            for (size_t j = start_idx; j < instructions.size(); j++) {
-                const auto& insn = instructions[j];
-                end_idx = j;
-                
-                // Track metadata
-                if (insn.is_syscall) {
+                // Track syscall
+                if (is_syscall) {
                     block.contains_syscall = true;
-                    block.syscall_address = insn.address;
-                }
-                if (insn.is_mov_to_rax) {
-                    block.last_rax_value = insn.rax_value;
+                    block.syscall_address = insn_addr;
+                    block.syscall_rax_value = current_rax;  // RAX at syscall
                 }
                 
-                // Check for block terminator
-                if (insn.is_branch) {
-                    block.ends_with_unconditional_jump = insn.is_unconditional_jump;
+                offset += insn.length;
+                uint64_t next_addr = insn_addr + insn.length;
+                
+                // Handle block terminators
+                if (is_branch) {
+                    bool is_unconditional = (insn.mnemonic == ZYDIS_MNEMONIC_JMP);
+                    block.ends_with_unconditional_jump = is_unconditional;
                     
-                    // Add jump target as successor
-                    if (insn.jump_target != 0) {
-                        block.successors.push_back(insn.jump_target);
+                    // Add jump target
+                    if (insn.operand_count > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        uint64_t target;
+                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &operands[0], insn_addr, &target))) {
+                            block.successors.push_back(target);
+                            worklist.insert(target);
+                        }
                     }
                     
                     // Conditional branches fall through
-                    if (!insn.is_unconditional_jump) {
-                        block.successors.push_back(insn.address + insn.length);
+                    if (!is_unconditional) {
+                        block.successors.push_back(next_addr);
+                        worklist.insert(next_addr);
                     }
                     break;
-                } else if (insn.is_call) {
+                } else if (is_call) {
                     block.ends_with_call = true;
+                    
+                    // Add call target
+                    if (insn.operand_count > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        uint64_t target;
+                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &operands[0], insn_addr, &target))) {
+                            block.successors.push_back(target);
+                            worklist.insert(target);
+                        }
+                    }
+                    
                     // Calls fall through
-                    block.successors.push_back(insn.address + insn.length);
+                    block.successors.push_back(next_addr);
+                    worklist.insert(next_addr);
                     break;
-                } else if (insn.is_ret) {
+                } else if (is_ret) {
                     block.ends_with_ret = true;
                     break;
-                } else if (insn.is_syscall) {
-                    // Syscalls continue to next instruction
-                    block.successors.push_back(insn.address + insn.length);
+                } else if (is_syscall) {
+                    // Syscalls continue
+                    block.successors.push_back(next_addr);
+                    worklist.insert(next_addr);
                     break;
                 }
                 
-                // Check if next instruction starts a new block
-                if (j + 1 < instructions.size() && 
-                    block_starts.count(instructions[j + 1].address)) {
-                    // Fall through to next block
-                    block.successors.push_back(instructions[j + 1].address);
+                // Check if we've hit a block start (from another path)
+                if (processed.count(next_addr) || worklist.count(next_addr)) {
+                    block.successors.push_back(next_addr);
                     break;
                 }
             }
             
-            block.end_address = instructions[end_idx].address;
+            // Set exit RAX value
+            block.last_rax_value = current_rax;
             cfg.blocks.push_back(std::move(block));
         }
         
