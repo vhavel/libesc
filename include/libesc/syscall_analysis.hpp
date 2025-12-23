@@ -1,30 +1,82 @@
 #pragma once
 
-#include "basic_block.hpp"
 #include <cstdint>
-#include <string>
 #include <vector>
+#include <string>
+#include <optional>
+#include <variant>
+#include <set>
 
 namespace libesc {
+
+/**
+ * @brief Marker type for tainted/unknown register values
+ */
+struct Tainted {
+    bool operator==(const Tainted&) const { return true; }
+    bool operator<(const Tainted&) const { return false; }
+};
+
+/**
+ * @brief Register value that can be concrete or tainted
+ */
+using RaxValue = std::variant<uint64_t, Tainted>;
+
+/**
+ * @brief Basic block with metadata extracted during disassembly
+ */
+struct BasicBlock {
+    uint64_t start_address;          // First instruction address
+    uint64_t end_address;            // Last instruction address
+    
+    std::vector<uint64_t> successors;  // Jump targets and fall-through addresses
+    
+    // Metadata extracted during disassembly
+    bool contains_syscall = false;
+    std::optional<uint64_t> syscall_address;     // Address of syscall instruction
+    std::optional<RaxValue> syscall_rax_value;   // RAX value at syscall (nullopt = needs propagation)
+    std::optional<uint64_t> last_rax_value;      // RAX value at block exit (nullopt = doesn't set RAX)
+    
+    // Block terminator type
+    bool ends_with_ret = false;
+    bool ends_with_unconditional_jump = false;
+    bool ends_with_call = false;
+};
 
 /**
  * @brief Information about a detected syscall
  */
 struct SyscallInfo {
-    uint64_t address;     // Address of the syscall instruction
-    int64_t number;       // Syscall number (-1 if unknown)
-    std::string name;     // Syscall name (empty if unknown or unnamed)
+    uint64_t address;              // Address of the syscall instruction
+    std::optional<uint64_t> number; // Syscall number (nullopt if unknown/tainted)
+    std::string name;              // Syscall name (empty if unknown or unnamed)
 };
 
 /**
- * @brief Analyze a CFG to detect syscalls and their numbers
- * 
- * Uses backward propagation through the CFG to determine RAX values
- * at syscall sites. Searches up to depth 5 backwards for RAX values.
- * 
- * @param cfg Control flow graph to analyze
- * @return Vector of detected syscalls with addresses, numbers, and names
+ * @brief Control flow graph represented as blocks with metadata
  */
-std::vector<SyscallInfo> analyze_syscalls(const ControlFlowGraph& cfg);
+struct ControlFlowGraph {
+    std::vector<BasicBlock> blocks;
+    
+    /**
+     * @brief Analyze syscalls in the CFG
+     * 
+     * Uses iterative dataflow analysis to propagate RAX values through
+     * the CFG and identify syscall numbers.
+     * 
+     * @return Vector of detected syscalls with addresses, numbers, and names
+     */
+    std::vector<SyscallInfo> analyze_syscalls() const;
+    
+    // Helper to find block containing an address
+    const BasicBlock* find_block(uint64_t address) const {
+        for (const auto& block : blocks) {
+            if (address >= block.start_address && address <= block.end_address) {
+                return &block;
+            }
+        }
+        return nullptr;
+    }
+};
 
 } // namespace libesc

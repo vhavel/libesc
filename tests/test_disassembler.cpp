@@ -14,8 +14,11 @@ void test_simple_syscall() {
     
     assert(cfg.blocks.size() == 1);
     assert(cfg.blocks[0].contains_syscall == true);
-    assert(cfg.blocks[0].syscall_address == 0x1005);
-    assert(cfg.blocks[0].syscall_rax_value == 1);
+    assert(cfg.blocks[0].syscall_address.has_value());
+    assert(*cfg.blocks[0].syscall_address == 0x1005);
+    assert(cfg.blocks[0].syscall_rax_value.has_value());
+    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 1);
 }
 
 void test_syscall_with_fallthrough() {
@@ -32,7 +35,9 @@ void test_syscall_with_fallthrough() {
     
     // First block: syscall
     assert(cfg.blocks[0].contains_syscall == true);
-    assert(cfg.blocks[0].syscall_rax_value == 0x3c);
+    assert(cfg.blocks[0].syscall_rax_value.has_value());
+    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0x3c);
     assert(cfg.blocks[0].successors.size() == 1);
     assert(cfg.blocks[0].successors[0] == 0x2007);
     
@@ -76,7 +81,9 @@ void test_rax_tracking_through_block() {
     auto cfg = disasm.disassemble(code, 0x4000);
     
     assert(cfg.blocks.size() == 1);
-    assert(cfg.blocks[0].syscall_rax_value == 0x10);  // Should use last value
+    assert(cfg.blocks[0].syscall_rax_value.has_value());
+    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0x10);  // Should use last value
 }
 
 void test_rax_after_syscall() {
@@ -93,11 +100,15 @@ void test_rax_after_syscall() {
     assert(cfg.blocks.size() == 2);
     
     // First block: syscall
-    assert(cfg.blocks[0].syscall_rax_value == 0xc);   // Syscall uses 0xc
-    assert(cfg.blocks[0].last_rax_value == 0xc);       // Exit value still 0xc (after syscall is new block)
+    assert(cfg.blocks[0].syscall_rax_value.has_value());
+    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0xc);   // Syscall uses 0xc
+    assert(cfg.blocks[0].last_rax_value.has_value());
+    assert(*cfg.blocks[0].last_rax_value == 0xc);       // Exit value still 0xc (after syscall is new block)
     
     // Second block: after syscall
-    assert(cfg.blocks[1].last_rax_value == 0xff);      // This block has 0xff
+    assert(cfg.blocks[1].last_rax_value.has_value());
+    assert(*cfg.blocks[1].last_rax_value == 0xff);      // This block has 0xff
 }
 
 void test_call_instruction() {
@@ -136,8 +147,29 @@ void test_register_move_to_rax() {
     auto cfg = disasm.disassemble(code, 0x6000);
     
     assert(cfg.blocks.size() == 1);
-    // syscall_rax_value should be -1 (unknown) because we only track immediates
-    assert(cfg.blocks[0].syscall_rax_value == -1);
+    // syscall_rax_value should be nullopt (unknown) because we only track immediates
+    assert(!cfg.blocks[0].syscall_rax_value.has_value());
+}
+
+void test_multipath_tainting() {
+    // Two paths with different RAX values converging to syscall
+    auto code = make_code({
+        JZ_REL8(7),               // jz +7 (to block B if zero flag set)
+        // Fall through to block A
+        MOV_EAX_IMM32(60),        // Block A: mov eax, 60 (exit)
+        JMP_REL8(5),              // jmp +5 (to block C)
+        MOV_EAX_IMM32(39),        // Block B: mov eax, 39 (getpid)
+        NOP(),                    // nop (fall through to C)
+        SYSCALL()                 // Block C: syscall (two different RAX values)
+    });
+    
+    libesc::Disassembler disasm(libesc::Disassembler::Architecture::X86_64);
+    auto cfg = disasm.disassemble(code, 0x1000);
+    auto syscalls = cfg.analyze_syscalls();
+    
+    // Should find one syscall with tainted/unknown number
+    assert(syscalls.size() == 1);
+    assert(!syscalls[0].number.has_value());  // Conflicting values -> tainted
 }
 
 int main() {
@@ -148,5 +180,6 @@ int main() {
     test_rax_after_syscall();
     test_call_instruction();
     test_register_move_to_rax();
+    test_multipath_tainting();
     return 0;
 }

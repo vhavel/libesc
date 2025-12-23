@@ -62,7 +62,7 @@ public:
             // Build this block by decoding instructions until terminator
             BasicBlock block;
             block.start_address = block_start;
-            int64_t current_rax = -1;  // Track current RAX value through the block
+            std::optional<uint64_t> current_rax;  // Track current RAX value through the block
             
             while (offset < code.size()) {
                 ZydisDecodedInstruction insn;
@@ -99,7 +99,7 @@ public:
                     (operands[0].reg.value == ZYDIS_REGISTER_RAX ||
                      operands[0].reg.value == ZYDIS_REGISTER_EAX) &&
                     operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                    current_rax = operands[1].imm.value.s;
+                    current_rax = static_cast<uint64_t>(operands[1].imm.value.u);
                 }
                 // Any other write to RAX/EAX makes it unknown
                 else if (insn.operand_count > 0 &&
@@ -118,7 +118,7 @@ public:
                         }
                     }
                     if (writes_rax) {
-                        current_rax = -1;  // Unknown value
+                        current_rax = std::nullopt;  // Unknown value
                     }
                 }
                 
@@ -126,7 +126,10 @@ public:
                 if (is_syscall) {
                     block.contains_syscall = true;
                     block.syscall_address = insn_addr;
-                    block.syscall_rax_value = current_rax;  // RAX at syscall
+                    if (current_rax.has_value()) {
+                        block.syscall_rax_value = *current_rax;
+                    }
+                    // If current_rax is nullopt, syscall_rax_value stays nullopt (needs propagation)
                 }
                 
                 offset += insn.length;

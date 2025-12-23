@@ -1,15 +1,14 @@
 #include "libesc/syscall_analysis.hpp"
 #include <unordered_map>
-#include <unordered_set>
 #include <set>
-#include <vector>
+#include <functional>
 
 namespace libesc {
 
 namespace {
 
 // Limited syscall name table for Linux x86-64
-const char* get_syscall_name(int64_t syscall_number) {
+const char* get_syscall_name(uint64_t syscall_number) {
     switch (syscall_number) {
         case 0: return "read";
         case 1: return "write";
@@ -59,88 +58,137 @@ const char* get_syscall_name(int64_t syscall_number) {
 
 } // anonymous namespace
 
-std::vector<SyscallInfo> analyze_syscalls(const ControlFlowGraph& cfg) {
+std::vector<SyscallInfo> ControlFlowGraph::analyze_syscalls() const {
     // Build address-to-block map for fast lookups
-    std::unordered_map<uint64_t, const BasicBlock*> addr_to_block;
-    addr_to_block.reserve(cfg.blocks.size());
-    for (const auto& block : cfg.blocks) {
-        addr_to_block[block.start_address] = &block;
+    std::unordered_map<uint64_t, BasicBlock*> addr_to_block;
+    addr_to_block.reserve(blocks.size());
+    for (auto& block : blocks) {
+        addr_to_block[block.start_address] = const_cast<BasicBlock*>(&block);
     }
     
     // Build predecessor map (blocks that jump TO each block)
-    std::unordered_map<const BasicBlock*, std::vector<const BasicBlock*>> predecessors;
-    for (const auto& block : cfg.blocks) {
+    std::unordered_map<BasicBlock*, std::vector<BasicBlock*>> predecessors;
+    for (auto& block : blocks) {
         for (uint64_t succ_addr : block.successors) {
             auto it = addr_to_block.find(succ_addr);
             if (it != addr_to_block.end()) {
-                predecessors[it->second].push_back(&block);
+                predecessors[it->second].push_back(const_cast<BasicBlock*>(&block));
             }
         }
     }
     
-    // Lambda to find RAX values for a syscall block using backward propagation
-    auto find_rax_values = [&](const BasicBlock* syscall_block) -> std::set<int64_t> {
-        std::set<int64_t> rax_values;
+    // Track possible RAX values at each block's syscall (if it has one)
+    std::unordered_map<BasicBlock*, std::set<RaxValue>> syscall_rax_values;
+    
+    // Track possible RAX values at each block's exit
+    std::unordered_map<BasicBlock*, std::set<RaxValue>> exit_rax_values;
+    
+    // Initialize with local information
+    for (auto& block : blocks) {
+        BasicBlock* b = const_cast<BasicBlock*>(&block);
         
-        // If block sets RAX before syscall, use that
-        if (syscall_block->syscall_rax_value >= 0) {
-            rax_values.insert(syscall_block->syscall_rax_value);
-            return rax_values;
+        if (block.last_rax_value.has_value()) {
+            exit_rax_values[b].insert(*block.last_rax_value);
         }
-        
-        // Otherwise, search backwards through predecessors
-        std::unordered_set<const BasicBlock*> visited;
-        std::vector<std::pair<const BasicBlock*, int>> worklist; // (block, depth)
-        
-        for (auto* pred : predecessors[syscall_block]) {
-            worklist.push_back({pred, 1});
+        if (block.contains_syscall && block.syscall_rax_value.has_value()) {
+            exit_rax_values[b].insert(*block.syscall_rax_value);
+            syscall_rax_values[b].insert(*block.syscall_rax_value);
         }
+    }
+    
+    // Floyd-Warshall style iterations until convergence
+    bool changed = true;
+    int iteration = 0;
+    while (changed && iteration < 100) {
+        changed = false;
+        iteration++;
         
-        while (!worklist.empty()) {
-            auto [block, depth] = worklist.back();
-            worklist.pop_back();
+        for (auto& block : blocks) {
+            BasicBlock* b = const_cast<BasicBlock*>(&block);
             
-            if (visited.count(block) || depth > 5) {  // Constant depth limit
-                continue;
+            // Merge all incoming RAX values from predecessors
+            std::set<RaxValue> incoming_rax;
+            for (auto* pred : predecessors[b]) {
+                if (exit_rax_values.count(pred)) {
+                    for (const auto& val : exit_rax_values[pred]) {
+                        incoming_rax.insert(val);
+                    }
+                }
             }
-            visited.insert(block);
             
-            // If this block sets RAX at exit, use that value
-            if (block->last_rax_value >= 0) {
-                rax_values.insert(block->last_rax_value);
-            } else {
-                // Keep searching backwards
-                for (auto* pred : predecessors[block]) {
-                    worklist.push_back({pred, depth + 1});
+            // If multiple different concrete values flow in, mark as tainted
+            if (incoming_rax.size() > 1) {
+                bool has_concrete = false;
+                std::optional<uint64_t> first_concrete;
+                for (const auto& val : incoming_rax) {
+                    if (std::holds_alternative<uint64_t>(val)) {
+                        if (!has_concrete) {
+                            first_concrete = std::get<uint64_t>(val);
+                            has_concrete = true;
+                        } else if (*first_concrete != std::get<uint64_t>(val)) {
+                            // Different concrete values - mark as tainted
+                            incoming_rax.clear();
+                            incoming_rax.insert(Tainted{});
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            // If block has syscall and no local RAX assignment before syscall
+            if (block.contains_syscall && !block.syscall_rax_value.has_value()) {
+                auto& current = syscall_rax_values[b];
+                size_t old_size = current.size();
+                for (const auto& val : incoming_rax) {
+                    current.insert(val);
+                }
+                if (current.size() != old_size) {
+                    changed = true;
+                }
+            }
+            
+            // If block doesn't set RAX locally, propagate incoming values
+            if (!block.last_rax_value.has_value() && !incoming_rax.empty()) {
+                auto& current = exit_rax_values[b];
+                size_t old_size = current.size();
+                for (const auto& val : incoming_rax) {
+                    current.insert(val);
+                }
+                if (current.size() != old_size) {
+                    changed = true;
                 }
             }
         }
-        
-        // If no RAX value found, mark as unknown
-        if (rax_values.empty()) {
-            rax_values.insert(-1);
-        }
-        
-        return rax_values;
-    };
+    }
     
     // Collect all syscalls
     std::vector<SyscallInfo> syscalls;
-    for (const auto& block : cfg.blocks) {
+    for (const auto& block : blocks) {
         if (block.contains_syscall) {
-            auto rax_values = find_rax_values(&block);
+            BasicBlock* b = const_cast<BasicBlock*>(&block);
             
-            // Take the first value (or -1 if multiple/unknown)
-            int64_t syscall_num = -1;
-            if (rax_values.size() == 1) {
-                syscall_num = *rax_values.begin();
+            // Determine syscall number
+            std::optional<uint64_t> syscall_num;
+            
+            // First check if block sets RAX before syscall
+            if (block.syscall_rax_value.has_value()) {
+                const auto& val = *block.syscall_rax_value;
+                if (std::holds_alternative<uint64_t>(val)) {
+                    syscall_num = std::get<uint64_t>(val);
+                }
+            } else if (syscall_rax_values.count(b) && syscall_rax_values[b].size() == 1) {
+                // Single propagated value
+                const auto& val = *syscall_rax_values[b].begin();
+                if (std::holds_alternative<uint64_t>(val)) {
+                    syscall_num = std::get<uint64_t>(val);
+                }
             }
             
             SyscallInfo info;
-            info.address = block.syscall_address;
+            info.address = *block.syscall_address;
             info.number = syscall_num;
-            if (syscall_num >= 0) {
-                const char* name = get_syscall_name(syscall_num);
+            if (syscall_num.has_value()) {
+                const char* name = get_syscall_name(*syscall_num);
                 if (name && *name) {
                     info.name = name;
                 }

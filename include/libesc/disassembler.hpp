@@ -1,6 +1,6 @@
 #pragma once
 
-#include "basic_block.hpp"
+#include "syscall_analysis.hpp"
 #include <vector>
 #include <cstdint>
 #include <memory>

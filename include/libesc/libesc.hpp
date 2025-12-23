@@ -7,7 +7,6 @@
 
 #include "elf_inspector.hpp"
 #include "disassembler.hpp"
-#include "basic_block.hpp"
 #include "syscall_analysis.hpp"
 
 namespace libesc {

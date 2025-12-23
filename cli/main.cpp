@@ -14,12 +14,12 @@ int main(int argc, char* argv[]) {
         libesc::ElfInspector inspector(binary_path);
         libesc::Disassembler disasm(libesc::Disassembler::Architecture::X86_64);
         auto cfg = disasm.disassemble(inspector.get_code_section(), inspector.get_text_base());
-        auto syscalls = libesc::analyze_syscalls(cfg);
+        auto syscalls = cfg.analyze_syscalls();
         
         for (const auto& sc : syscalls) {
             std::cout << "0x" << std::hex << sc.address << ": ";
-            if (sc.number >= 0) {
-                std::cout << "syscall " << std::dec << sc.number;
+            if (sc.number.has_value()) {
+                std::cout << "syscall " << std::dec << *sc.number;
                 if (!sc.name.empty()) {
                     std::cout << " (" << sc.name << ")";
                 }
