@@ -38,6 +38,7 @@ FetchContent_MakeAvailable(zydis)
 set(LIBESC_SOURCES
     src/elf_inspector.cpp
     src/disassembler.cpp
+    src/syscall_analysis.cpp
 )
 
 # Create library
