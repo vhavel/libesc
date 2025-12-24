@@ -11,10 +11,7 @@ int main(int argc, char* argv[]) {
     const char* binary_path = argv[1];
 
     try {
-        libesc::ElfInspector inspector(binary_path);
-        libesc::Disassembler disasm(libesc::Disassembler::Architecture::X86_64);
-        auto cfg = disasm.disassemble(inspector.get_code_section(), inspector.get_text_base());
-        auto syscalls = cfg.analyze_syscalls();
+        auto syscalls = libesc::analyze_elf_syscalls(binary_path);
         
         for (const auto& sc : syscalls) {
             std::cout << "0x" << std::hex << sc.address << ": ";

@@ -32,14 +32,12 @@ struct BasicBlock {
     std::vector<uint64_t> successors;  // Jump targets and fall-through addresses
     
     // Metadata extracted during disassembly
-    bool contains_syscall = false;
     std::optional<uint64_t> syscall_address;     // Address of syscall instruction
-    std::optional<RaxValue> syscall_rax_value;   // RAX value at syscall (nullopt = needs propagation)
-    std::optional<uint64_t> last_rax_value;      // RAX value at block exit (nullopt = doesn't set RAX)
+    RaxValue syscall_rax_value = Tainted{};      // RAX value at syscall (Tainted = unknown/needs propagation)
+    RaxValue last_rax_value = Tainted{};         // RAX value at block exit (Tainted = doesn't set RAX)
     
     // Block terminator type
     bool ends_with_ret = false;
-    bool ends_with_unconditional_jump = false;
     bool ends_with_call = false;
 };
 

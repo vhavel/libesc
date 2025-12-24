@@ -13,12 +13,10 @@ void test_simple_syscall() {
     auto cfg = disasm.disassemble(code, 0x1000);
     
     assert(cfg.blocks.size() == 1);
-    assert(cfg.blocks[0].contains_syscall == true);
     assert(cfg.blocks[0].syscall_address.has_value());
     assert(*cfg.blocks[0].syscall_address == 0x1005);
-    assert(cfg.blocks[0].syscall_rax_value.has_value());
-    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
-    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 1);
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[0].syscall_rax_value) == 1);
 }
 
 void test_syscall_with_fallthrough() {
@@ -34,15 +32,14 @@ void test_syscall_with_fallthrough() {
     assert(cfg.blocks.size() == 2);
     
     // First block: syscall
-    assert(cfg.blocks[0].contains_syscall == true);
-    assert(cfg.blocks[0].syscall_rax_value.has_value());
-    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
-    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0x3c);
+    assert(cfg.blocks[0].syscall_address.has_value());
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[0].syscall_rax_value) == 0x3c);
     assert(cfg.blocks[0].successors.size() == 1);
     assert(cfg.blocks[0].successors[0] == 0x2007);
     
     // Second block: ret
-    assert(cfg.blocks[1].contains_syscall == false);
+    assert(!cfg.blocks[1].syscall_address.has_value());
     assert(cfg.blocks[1].ends_with_ret == true);
 }
 
@@ -81,9 +78,8 @@ void test_rax_tracking_through_block() {
     auto cfg = disasm.disassemble(code, 0x4000);
     
     assert(cfg.blocks.size() == 1);
-    assert(cfg.blocks[0].syscall_rax_value.has_value());
-    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
-    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0x10);  // Should use last value
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[0].syscall_rax_value) == 0x10);  // Should use last value
 }
 
 void test_rax_after_syscall() {
@@ -100,15 +96,14 @@ void test_rax_after_syscall() {
     assert(cfg.blocks.size() == 2);
     
     // First block: syscall
-    assert(cfg.blocks[0].syscall_rax_value.has_value());
-    assert(std::holds_alternative<uint64_t>(*cfg.blocks[0].syscall_rax_value));
-    assert(std::get<uint64_t>(*cfg.blocks[0].syscall_rax_value) == 0xc);   // Syscall uses 0xc
-    assert(cfg.blocks[0].last_rax_value.has_value());
-    assert(*cfg.blocks[0].last_rax_value == 0xc);       // Exit value still 0xc (after syscall is new block)
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[0].syscall_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[0].syscall_rax_value) == 0xc);   // Syscall uses 0xc
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[0].last_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[0].last_rax_value) == 0xc);       // Exit value still 0xc (after syscall is new block)
     
     // Second block: after syscall
-    assert(cfg.blocks[1].last_rax_value.has_value());
-    assert(*cfg.blocks[1].last_rax_value == 0xff);      // This block has 0xff
+    assert(std::holds_alternative<uint64_t>(cfg.blocks[1].last_rax_value));
+    assert(std::get<uint64_t>(cfg.blocks[1].last_rax_value) == 0xff);      // This block has 0xff
 }
 
 void test_call_instruction() {
@@ -147,8 +142,8 @@ void test_register_move_to_rax() {
     auto cfg = disasm.disassemble(code, 0x6000);
     
     assert(cfg.blocks.size() == 1);
-    // syscall_rax_value should be nullopt (unknown) because we only track immediates
-    assert(!cfg.blocks[0].syscall_rax_value.has_value());
+    // syscall_rax_value should be Tainted (unknown) because we only track immediates
+    assert(std::holds_alternative<libesc::Tainted>(cfg.blocks[0].syscall_rax_value));
 }
 
 void test_multipath_tainting() {

@@ -14,25 +14,39 @@ option(BUILD_CLI "Build command-line tool" ON)
 option(BUILD_TESTS "Build tests" ON)
 option(BUILD_EXAMPLES "Build examples" ON)
 
-# Fetch Zydis disassembler
+# Fetch Capstone disassembler
 include(FetchContent)
 
 # Use native Linux temp directory to avoid WSL/Windows filesystem issues
 set(FETCHCONTENT_BASE_DIR "${CMAKE_BINARY_DIR}/_deps" CACHE PATH "FetchContent base directory")
 
 FetchContent_Declare(
-    zydis
-    GIT_REPOSITORY https://github.com/zyantific/zydis.git
-    GIT_TAG        v4.1.0
+    capstone
+    GIT_REPOSITORY https://github.com/capstone-engine/capstone.git
+    GIT_TAG        5.0.1
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   TRUE
 )
 
-# Configure Zydis options
-set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+# Configure Capstone options
+set(CAPSTONE_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_BUILD_CSTOOL OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_X86_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_ARM_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_ARM64_SUPPORT ON CACHE BOOL "" FORCE)
+set(CAPSTONE_MIPS_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_PPC_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_SPARC_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_SYSZ_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_XCORE_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_M68K_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_TMS320C64X_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_M680X_SUPPORT OFF CACHE BOOL "" FORCE)
+set(CAPSTONE_EVM_SUPPORT OFF CACHE BOOL "" FORCE)
 
-FetchContent_MakeAvailable(zydis)
+FetchContent_MakeAvailable(capstone)
 
 # Library sources
 set(LIBESC_SOURCES
@@ -47,13 +61,13 @@ target_include_directories(libesc
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-        $<BUILD_INTERFACE:${zydis_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${capstone_SOURCE_DIR}/include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 # Link dependencies
-target_link_libraries(libesc PRIVATE Zydis)
+target_link_libraries(libesc PRIVATE capstone)
 
 # Set library properties
 set_target_properties(libesc PROPERTIES

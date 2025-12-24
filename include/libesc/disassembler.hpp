@@ -14,7 +14,9 @@ class Disassembler {
 public:
     enum class Architecture {
         X86_64,
-        X86_32
+        X86_32,
+        ARM,
+        ARM64
     };
 
     /**

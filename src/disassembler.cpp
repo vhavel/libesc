@@ -1,5 +1,5 @@
 #include "libesc/disassembler.hpp"
-#include <Zydis/Zydis.h>
+#include <capstone/capstone.h>
 #include <stdexcept>
 #include <map>
 #include <set>
@@ -10,25 +10,40 @@ namespace libesc {
 class Disassembler::Impl {
 public:
     explicit Impl(Architecture arch) : arch_(arch) {
-        ZydisMachineMode machine_mode;
-        ZydisStackWidth stack_width;
+        cs_arch cs_arch_val;
+        cs_mode cs_mode_val;
         
         switch (arch) {
             case Architecture::X86_64:
-                machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
-                stack_width = ZYDIS_STACK_WIDTH_64;
+                cs_arch_val = CS_ARCH_X86;
+                cs_mode_val = CS_MODE_64;
                 break;
             case Architecture::X86_32:
-                machine_mode = ZYDIS_MACHINE_MODE_LEGACY_32;
-                stack_width = ZYDIS_STACK_WIDTH_32;
+                cs_arch_val = CS_ARCH_X86;
+                cs_mode_val = CS_MODE_32;
+                break;
+            case Architecture::ARM:
+                cs_arch_val = CS_ARCH_ARM;
+                cs_mode_val = CS_MODE_ARM;
+                break;
+            case Architecture::ARM64:
+                cs_arch_val = CS_ARCH_ARM64;
+                cs_mode_val = CS_MODE_ARM;
                 break;
             default:
-                throw std::runtime_error("Unsupported architecture (Zydis only supports x86/x86-64)");
+                throw std::runtime_error("Unsupported architecture");
         }
         
-        if (!ZYAN_SUCCESS(ZydisDecoderInit(&decoder_, machine_mode, stack_width))) {
-            throw std::runtime_error("Failed to initialize Zydis decoder");
+        if (cs_open(cs_arch_val, cs_mode_val, &handle_) != CS_ERR_OK) {
+            throw std::runtime_error("Failed to initialize Capstone");
         }
+        
+        // Enable detail mode for operand information
+        cs_option(handle_, CS_OPT_DETAIL, CS_OPT_ON);
+    }
+    
+    ~Impl() {
+        cs_close(&handle_);
     }
 
     ControlFlowGraph disassemble(const std::vector<uint8_t>& code, 
@@ -64,86 +79,73 @@ public:
             block.start_address = block_start;
             std::optional<uint64_t> current_rax;  // Track current RAX value through the block
             
-            while (offset < code.size()) {
-                ZydisDecodedInstruction insn;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-                
-                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder_,
-                                                         code.data() + offset,
-                                                         code.size() - offset,
-                                                         &insn,
-                                                         operands))) {
-                    // Bad instruction - end block here
+            size_t remaining = code.size() - offset;
+            const uint8_t* code_ptr = code.data() + offset;
+            uint64_t current_address = block_start;
+            
+            auto insn_deleter = [](cs_insn* p) { if (p) cs_free(p, 1); };
+            
+            while (remaining > 0) {
+                std::unique_ptr<cs_insn, decltype(insn_deleter)> insn(cs_malloc(handle_), insn_deleter);
+                if (!cs_disasm_iter(handle_, &code_ptr, &remaining, &current_address, insn.get())) {
                     break;
                 }
+                block.end_address = insn->address;
                 
-                uint64_t insn_addr = base_address + offset;
-                block.end_address = insn_addr;
-                
-                bool is_branch = (insn.meta.category == ZYDIS_CATEGORY_COND_BR ||
-                                  insn.meta.category == ZYDIS_CATEGORY_UNCOND_BR);
-                bool is_call = (insn.meta.category == ZYDIS_CATEGORY_CALL);
-                bool is_ret = (insn.meta.category == ZYDIS_CATEGORY_RET ||
-                               insn.mnemonic == ZYDIS_MNEMONIC_HLT ||
-                               insn.mnemonic == ZYDIS_MNEMONIC_UD2);
-                bool is_syscall = (insn.mnemonic == ZYDIS_MNEMONIC_SYSCALL ||
-                                   insn.mnemonic == ZYDIS_MNEMONIC_SYSENTER ||
-                                   (insn.mnemonic == ZYDIS_MNEMONIC_INT && 
-                                    insn.operand_count > 0 &&
-                                    operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-                                    operands[0].imm.value.u == 0x80));
+                // Determine instruction type
+                bool is_branch = (insn->id >= X86_INS_JAE && insn->id <= X86_INS_JS) || 
+                                 insn->id == X86_INS_JMP ||
+                                 insn->id == X86_INS_LOOP || insn->id == X86_INS_LOOPE || insn->id == X86_INS_LOOPNE;
+                bool is_call = (insn->id == X86_INS_CALL);
+                bool is_ret = (insn->id == X86_INS_RET || insn->id == X86_INS_RETF ||
+                               insn->id == X86_INS_HLT || insn->id == X86_INS_UD2);
+                bool is_syscall = (insn->id == X86_INS_SYSCALL || insn->id == X86_INS_SYSENTER ||
+                                   (insn->id == X86_INS_INT && insn->detail &&
+                                    insn->detail->x86.op_count > 0 &&
+                                    insn->detail->x86.operands[0].type == X86_OP_IMM &&
+                                    insn->detail->x86.operands[0].imm == 0x80));
                 
                 // Track mov rax/eax, imm
-                if (insn.mnemonic == ZYDIS_MNEMONIC_MOV && insn.operand_count == 2 &&
-                    operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                    (operands[0].reg.value == ZYDIS_REGISTER_RAX ||
-                     operands[0].reg.value == ZYDIS_REGISTER_EAX) &&
-                    operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                    current_rax = static_cast<uint64_t>(operands[1].imm.value.u);
+                if (insn->id == X86_INS_MOV && insn->detail && insn->detail->x86.op_count == 2) {
+                    auto& op0 = insn->detail->x86.operands[0];
+                    auto& op1 = insn->detail->x86.operands[1];
+                    if (op0.type == X86_OP_REG && 
+                        (op0.reg == X86_REG_RAX || op0.reg == X86_REG_EAX) &&
+                        op1.type == X86_OP_IMM) {
+                        current_rax = static_cast<uint64_t>(op1.imm);
+                    }
                 }
                 // Any other write to RAX/EAX makes it unknown
-                else if (insn.operand_count > 0 &&
-                         operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                         (operands[0].reg.value == ZYDIS_REGISTER_RAX ||
-                          operands[0].reg.value == ZYDIS_REGISTER_EAX)) {
-                    // Check if this instruction writes to RAX (not just reads)
-                    bool writes_rax = false;
-                    for (size_t i = 0; i < insn.operand_count; i++) {
-                        if (operands[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                            (operands[i].reg.value == ZYDIS_REGISTER_RAX ||
-                             operands[i].reg.value == ZYDIS_REGISTER_EAX) &&
-                            (operands[i].actions & ZYDIS_OPERAND_ACTION_WRITE)) {
-                            writes_rax = true;
-                            break;
-                        }
-                    }
-                    if (writes_rax) {
+                else if (insn->detail && insn->detail->x86.op_count > 0) {
+                    auto& op0 = insn->detail->x86.operands[0];
+                    if (op0.type == X86_OP_REG &&
+                        (op0.reg == X86_REG_RAX || op0.reg == X86_REG_EAX) &&
+                        (op0.access & CS_AC_WRITE)) {
                         current_rax = std::nullopt;  // Unknown value
                     }
                 }
                 
                 // Track syscall
                 if (is_syscall) {
-                    block.contains_syscall = true;
-                    block.syscall_address = insn_addr;
+                    block.syscall_address = insn->address;
                     if (current_rax.has_value()) {
                         block.syscall_rax_value = *current_rax;
+                    } else {
+                        block.syscall_rax_value = Tainted{};
                     }
-                    // If current_rax is nullopt, syscall_rax_value stays nullopt (needs propagation)
                 }
                 
-                offset += insn.length;
-                uint64_t next_addr = insn_addr + insn.length;
+                uint64_t next_addr = insn->address + insn->size;
                 
                 // Handle block terminators
                 if (is_branch) {
-                    bool is_unconditional = (insn.mnemonic == ZYDIS_MNEMONIC_JMP);
-                    block.ends_with_unconditional_jump = is_unconditional;
+                    bool is_unconditional = (insn->id == X86_INS_JMP);
                     
                     // Add jump target
-                    if (insn.operand_count > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                        uint64_t target;
-                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &operands[0], insn_addr, &target))) {
+                    if (insn->detail && insn->detail->x86.op_count > 0) {
+                        auto& op = insn->detail->x86.operands[0];
+                        if (op.type == X86_OP_IMM) {
+                            uint64_t target = op.imm;
                             block.successors.push_back(target);
                             worklist.insert(target);
                         }
@@ -154,14 +156,16 @@ public:
                         block.successors.push_back(next_addr);
                         worklist.insert(next_addr);
                     }
+                    
                     break;
                 } else if (is_call) {
                     block.ends_with_call = true;
                     
                     // Add call target
-                    if (insn.operand_count > 0 && operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-                        uint64_t target;
-                        if (ZYAN_SUCCESS(ZydisCalcAbsoluteAddress(&insn, &operands[0], insn_addr, &target))) {
+                    if (insn->detail && insn->detail->x86.op_count > 0) {
+                        auto& op = insn->detail->x86.operands[0];
+                        if (op.type == X86_OP_IMM) {
+                            uint64_t target = op.imm;
                             block.successors.push_back(target);
                             worklist.insert(target);
                         }
@@ -170,6 +174,7 @@ public:
                     // Calls fall through
                     block.successors.push_back(next_addr);
                     worklist.insert(next_addr);
+                    
                     break;
                 } else if (is_ret) {
                     block.ends_with_ret = true;
@@ -189,7 +194,11 @@ public:
             }
             
             // Set exit RAX value
-            block.last_rax_value = current_rax;
+            if (current_rax.has_value()) {
+                block.last_rax_value = *current_rax;
+            } else {
+                block.last_rax_value = Tainted{};
+            }
             cfg.blocks.push_back(std::move(block));
         }
         
@@ -198,7 +207,7 @@ public:
 
 private:
     Architecture arch_;
-    ZydisDecoder decoder_;
+    csh handle_;
 };
 
 Disassembler::Disassembler(Architecture arch)

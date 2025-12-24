@@ -87,12 +87,12 @@ std::vector<SyscallInfo> ControlFlowGraph::analyze_syscalls() const {
     for (auto& block : blocks) {
         BasicBlock* b = const_cast<BasicBlock*>(&block);
         
-        if (block.last_rax_value.has_value()) {
-            exit_rax_values[b].insert(*block.last_rax_value);
+        if (!std::holds_alternative<Tainted>(block.last_rax_value)) {
+            exit_rax_values[b].insert(block.last_rax_value);
         }
-        if (block.contains_syscall && block.syscall_rax_value.has_value()) {
-            exit_rax_values[b].insert(*block.syscall_rax_value);
-            syscall_rax_values[b].insert(*block.syscall_rax_value);
+        if (block.syscall_address.has_value() && !std::holds_alternative<Tainted>(block.syscall_rax_value)) {
+            exit_rax_values[b].insert(block.syscall_rax_value);
+            syscall_rax_values[b].insert(block.syscall_rax_value);
         }
     }
     
@@ -136,7 +136,7 @@ std::vector<SyscallInfo> ControlFlowGraph::analyze_syscalls() const {
             }
             
             // If block has syscall and no local RAX assignment before syscall
-            if (block.contains_syscall && !block.syscall_rax_value.has_value()) {
+            if (block.syscall_address.has_value() && std::holds_alternative<Tainted>(block.syscall_rax_value)) {
                 auto& current = syscall_rax_values[b];
                 size_t old_size = current.size();
                 for (const auto& val : incoming_rax) {
@@ -148,7 +148,7 @@ std::vector<SyscallInfo> ControlFlowGraph::analyze_syscalls() const {
             }
             
             // If block doesn't set RAX locally, propagate incoming values
-            if (!block.last_rax_value.has_value() && !incoming_rax.empty()) {
+            if (std::holds_alternative<Tainted>(block.last_rax_value) && !incoming_rax.empty()) {
                 auto& current = exit_rax_values[b];
                 size_t old_size = current.size();
                 for (const auto& val : incoming_rax) {
@@ -164,15 +164,15 @@ std::vector<SyscallInfo> ControlFlowGraph::analyze_syscalls() const {
     // Collect all syscalls
     std::vector<SyscallInfo> syscalls;
     for (const auto& block : blocks) {
-        if (block.contains_syscall) {
+        if (block.syscall_address.has_value()) {
             BasicBlock* b = const_cast<BasicBlock*>(&block);
             
             // Determine syscall number
             std::optional<uint64_t> syscall_num;
             
             // First check if block sets RAX before syscall
-            if (block.syscall_rax_value.has_value()) {
-                const auto& val = *block.syscall_rax_value;
+            if (!std::holds_alternative<Tainted>(block.syscall_rax_value)) {
+                const auto& val = block.syscall_rax_value;
                 if (std::holds_alternative<uint64_t>(val)) {
                     syscall_num = std::get<uint64_t>(val);
                 }

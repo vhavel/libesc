@@ -27,7 +27,7 @@ int main() {
         // Show blocks with syscalls
         std::cout << "=== Blocks containing syscalls ===\n";
         for (const auto& block : cfg.blocks) {
-            if (block.contains_syscall) {
+            if (block.syscall_address.has_value()) {
                 std::cout << "Block [0x" << std::hex << block.start_address 
                          << " - 0x" << block.end_address << "]\n";
                 if (block.last_rax_value >= 0) {
