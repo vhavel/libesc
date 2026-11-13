@@ -5,7 +5,7 @@
  * @brief Main header file for libesc - ELF Syscall Inspector library
  */
 
-#include "elf_inspector.hpp"
+#include "elf_file.hpp"
 #include "disassembler.hpp"
 #include "syscall_analysis.hpp"
 
@@ -35,7 +35,7 @@ inline std::vector<SyscallInfo> analyze_elf_syscalls(
     const char* binary_path,
     Disassembler::Architecture arch = Disassembler::Architecture::X86_64)
 {
-    ElfInspector inspector(binary_path);
+    ElfFile inspector(binary_path);
     Disassembler disasm(arch);
     auto cfg = disasm.disassemble(inspector.get_code_section(), inspector.get_text_base());
     return cfg.analyze_syscalls();

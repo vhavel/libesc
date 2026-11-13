@@ -4,36 +4,23 @@
 
 int main() {
     try {
-        // Load ELF binary
-        libesc::ElfInspector inspector("../test_syscall");
+        // Analyze syscalls in the binary
+        auto syscalls = libesc::analyze_elf_syscalls("../test_syscall");
         
-        // Get binary information
-        auto info = inspector.get_info();
-        std::cout << "=== ELF Binary Information ===\n";
-        std::cout << "Architecture: " << info.architecture << "\n";
-        std::cout << "Entry point: 0x" << std::hex << info.entry_point << "\n\n";
+        std::cout << "=== Syscall Analysis ===\n";
+        std::cout << "Found " << std::dec << syscalls.size() << " syscalls\n\n";
         
-        // Disassemble and build CFG
-        auto arch = libesc::Disassembler::Architecture::X86_64;
-        libesc::Disassembler disasm(arch);
-        
-        // Get code and disassemble
-        auto code = inspector.get_code_section();
-        auto cfg = disasm.disassemble(code, inspector.get_text_base());
-        
-        std::cout << "=== Control Flow Graph ===\n";
-        std::cout << "Basic blocks: " << std::dec << cfg.blocks.size() << "\n\n";
-        
-        // Show blocks with syscalls
-        std::cout << "=== Blocks containing syscalls ===\n";
-        for (const auto& block : cfg.blocks) {
-            if (block.syscall_address.has_value()) {
-                std::cout << "Block [0x" << std::hex << block.start_address 
-                         << " - 0x" << block.end_address << "]\n";
-                if (block.last_rax_value >= 0) {
-                    std::cout << "  RAX value: " << std::dec << block.last_rax_value << "\n";
+        for (const auto& sc : syscalls) {
+            std::cout << "0x" << std::hex << sc.address << ": ";
+            if (sc.number.has_value()) {
+                std::cout << "syscall " << std::dec << *sc.number;
+                if (!sc.name.empty()) {
+                    std::cout << " (" << sc.name << ")";
                 }
+            } else {
+                std::cout << "syscall (number unknown)";
             }
+            std::cout << "\n";
         }
         
     } catch (const std::exception& e) {

@@ -30,3 +30,13 @@ Testing/
 lib/
 deps/
 third_party/*/build/
+
+# Local test/benchmark binaries
+/benchmark_disasm
+/profile_test
+/test_syscall
+/test_transitive
+
+# Backups
+*.backup
+*.bak*

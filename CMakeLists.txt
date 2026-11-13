@@ -50,7 +50,7 @@ FetchContent_MakeAvailable(capstone)
 
 # Library sources
 set(LIBESC_SOURCES
-    src/elf_inspector.cpp
+    src/elf_file.cpp
     src/disassembler.cpp
     src/syscall_analysis.cpp
 )
